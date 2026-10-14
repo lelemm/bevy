@@ -48,7 +48,7 @@ use bevy_ecs::{
 };
 use bevy_image::Image;
 use bevy_math::{uvec2, vec4, Rect, UVec2};
-use bevy_platform::collections::HashSet;
+use bevy_platform::collections::{HashMap, HashSet};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     render_asset::RenderAssets,
@@ -152,8 +152,23 @@ pub struct RenderLightmaps {
 
     pending_lightmaps: HashSet<(LightmapSlabIndex, LightmapSlotIndex)>,
 
+    /// Entities that use the same lightmap image share one slot.
+    shared_slots: SharedLightmapSlots,
+
     /// Whether bindless textures are supported on this platform.
     pub(crate) bindless_supported: bool,
+}
+
+/// Tracks the slot that holds each lightmap image and how many entities use it.
+///
+/// Without this, every lightmapped entity would get a slot of its own, even when
+/// many entities share one lightmap atlas through [`Lightmap::uv_rect`]. Those
+/// entities would then land in different slabs, which prevents batching and
+/// multiplies the lightmap bind groups created every frame.
+#[derive(Default)]
+struct SharedLightmapSlots {
+    by_image: HashMap<AssetId<Image>, (LightmapSlabIndex, LightmapSlotIndex, u32)>,
+    by_slot: HashMap<(LightmapSlabIndex, LightmapSlotIndex), AssetId<Image>>,
 }
 
 /// A binding array that contains lightmaps.
@@ -226,8 +241,8 @@ fn extract_lightmaps(
             continue;
         }
 
-        let (slab_index, slot_index) =
-            render_lightmaps.allocate(&fallback_images, lightmap.image.id());
+        let (slab_index, slot_index, newly_allocated) =
+            render_lightmaps.acquire_slot(&fallback_images, lightmap.image.id());
         render_lightmaps.render_lightmaps.insert(
             entity.into(),
             RenderLightmap::new(
@@ -238,9 +253,11 @@ fn extract_lightmaps(
             ),
         );
 
-        render_lightmaps
-            .pending_lightmaps
-            .insert((slab_index, slot_index));
+        if newly_allocated {
+            render_lightmaps
+                .pending_lightmaps
+                .insert((slab_index, slot_index));
+        }
     }
 
     for entity in removed_lightmaps_query.read() {
@@ -259,10 +276,11 @@ fn extract_lightmaps(
             continue;
         };
 
-        render_lightmaps.remove(&fallback_images, slab_index, slot_index);
-        render_lightmaps
-            .pending_lightmaps
-            .remove(&(slab_index, slot_index));
+        if render_lightmaps.release_slot(&fallback_images, slab_index, slot_index) {
+            render_lightmaps
+                .pending_lightmaps
+                .remove(&(slab_index, slot_index));
+        }
     }
 
     render_lightmaps
@@ -342,6 +360,7 @@ pub fn init_render_lightmaps(
         slabs: vec![],
         free_slabs: FixedBitSet::new(),
         pending_lightmaps: default(),
+        shared_slots: default(),
         bindless_supported,
     });
 }
@@ -355,6 +374,36 @@ impl RenderLightmaps {
         self.slabs
             .push(LightmapSlab::new(fallback_images, self.bindless_supported));
         slab_index
+    }
+
+    /// Returns the slot that holds `image_id`, allocating one only if no other
+    /// entity uses this image yet. The flag is true for a newly allocated slot.
+    fn acquire_slot(
+        &mut self,
+        fallback_images: &FallbackImage,
+        image_id: AssetId<Image>,
+    ) -> (LightmapSlabIndex, LightmapSlotIndex, bool) {
+        if let Some((slab_index, slot_index)) = self.shared_slots.add_user(image_id) {
+            return (slab_index, slot_index, false);
+        }
+        let (slab_index, slot_index) = self.allocate(fallback_images, image_id);
+        self.shared_slots.insert(image_id, slab_index, slot_index);
+        (slab_index, slot_index, true)
+    }
+
+    /// Releases one entity's use of a slot. The slot is freed only once no
+    /// entity uses its image anymore; returns true in that case.
+    fn release_slot(
+        &mut self,
+        fallback_images: &FallbackImage,
+        slab_index: LightmapSlabIndex,
+        slot_index: LightmapSlotIndex,
+    ) -> bool {
+        if !self.shared_slots.remove_user(slab_index, slot_index) {
+            return false;
+        }
+        self.remove(fallback_images, slab_index, slot_index);
+        true
     }
 
     fn allocate(
@@ -388,6 +437,50 @@ impl RenderLightmaps {
         if !slab.is_full() {
             self.free_slabs.grow_and_insert(slab_index.into());
         }
+    }
+}
+
+impl SharedLightmapSlots {
+    /// If `image_id` already has a slot, counts one more user and returns it.
+    fn add_user(
+        &mut self,
+        image_id: AssetId<Image>,
+    ) -> Option<(LightmapSlabIndex, LightmapSlotIndex)> {
+        let (slab_index, slot_index, users) = self.by_image.get_mut(&image_id)?;
+        *users += 1;
+        Some((*slab_index, *slot_index))
+    }
+
+    /// Records a newly allocated slot for `image_id`, with one user.
+    fn insert(
+        &mut self,
+        image_id: AssetId<Image>,
+        slab_index: LightmapSlabIndex,
+        slot_index: LightmapSlotIndex,
+    ) {
+        self.by_image.insert(image_id, (slab_index, slot_index, 1));
+        self.by_slot.insert((slab_index, slot_index), image_id);
+    }
+
+    /// Counts one user less of a slot; returns true when it has no users left.
+    fn remove_user(
+        &mut self,
+        slab_index: LightmapSlabIndex,
+        slot_index: LightmapSlotIndex,
+    ) -> bool {
+        let Some(image_id) = self.by_slot.get(&(slab_index, slot_index)).copied() else {
+            return true;
+        };
+        let Some((_, _, users)) = self.by_image.get_mut(&image_id) else {
+            return true;
+        };
+        *users -= 1;
+        if *users > 0 {
+            return false;
+        }
+        self.by_image.remove(&image_id);
+        self.by_slot.remove(&(slab_index, slot_index));
+        true
     }
 }
 
@@ -517,5 +610,25 @@ impl From<LightmapSlotIndex> for u16 {
 impl From<LightmapSlotIndex> for u32 {
     fn from(value: LightmapSlotIndex) -> Self {
         value.0.get() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entities_sharing_an_image_share_its_slot_until_the_last_is_released() {
+        let mut slots = SharedLightmapSlots::default();
+        let image = AssetId::<Image>::default();
+        let (slab, slot) = (LightmapSlabIndex::from(0u32), LightmapSlotIndex::from(0u32));
+
+        assert_eq!(slots.add_user(image), None);
+        slots.insert(image, slab, slot);
+        assert_eq!(slots.add_user(image), Some((slab, slot)));
+
+        assert!(!slots.remove_user(slab, slot));
+        assert!(slots.remove_user(slab, slot));
+        assert_eq!(slots.add_user(image), None);
     }
 }
